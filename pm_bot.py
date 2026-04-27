@@ -1,237 +1,396 @@
 #!/usr/bin/env python3
-from flask import Flask, jsonify
-import json, time, logging, os, threading
+"""
+Polymarket 交易机器人 — 学习版
+可插拔策略架构 + 真实CLOB签名下单
+先跑扫描 + 套利，策略随时换
+"""
+import json, time, logging, sys, os
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ─── 日志 ───
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler("pm_bot.log"), logging.StreamHandler(sys.stdout)],
+)
 log = logging.getLogger("pm")
 
+# ─── 可调参数 ───
 BET = 4.0
-MAX_OCCUPIED = 20.0
+MAX_OCCUPIED = 8.0
+LOSS_LIMIT = 3.0
 CYCLE_S = 300
+
+# ─── API ───
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 CHAIN = 137
 CLOB_CONTRACT = "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
-TARGET_SLUGS = {"btc-5m":"BTC","eth-5m":"ETH","sol-5m":"SOL","xrp-5m":"XRP","doge-5m":"DOGE","hype-5m":"HYPE","bnb-5m":"BNB"}
 
-import requests as _r
-def _get(url, to=15):
+# ─── 网络请求 ───
+try:
+    import requests as _r
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
+
+def _proxy(): return None  # Railway/直连模式
+    p = {}
+    for k in ['https_proxy','HTTPS_PROXY','http_proxy','HTTP_PROXY','all_proxy','ALL_PROXY']:
+        v = os.environ.get(k, "").strip()
+        if v: p["http"] = v; p["https"] = v; return p
+    return None
+
+def _get(url, timeout=20):
+    if _HAS_REQUESTS:
+        try: r = _r.get(url, headers={"UA":"pm-bot"}, proxies=_proxy(), timeout=timeout); return r.json() if r.status_code==200 else {}
+        except Exception as e: log.warning(f"GET {url[:50]}: {e}"); return {}
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+    for k in ['http_proxy','https_proxy']:
+        if os.environ.get(k)=="": os.environ.pop(k,None)
     try:
-        r = _r.get(url, headers={"User-Agent":"pm-bot"}, timeout=to)
-        return r.json() if r.status_code==200 else {}
-    except:
-        return {}
+        with urlopen(Request(url,headers={"User-Agent":"pm-bot"}), timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except: return {}
 
-def _post(url, d):
+def _post(url, data):
+    if _HAS_REQUESTS:
+        try:
+            h = {"Content-Type":"application/json","UA":"pm-bot"}
+            r = _r.post(url, json=data, headers=h, proxies=_proxy(), timeout=15)
+            return r.json() if r.status_code in [200,201] else {"error":f"HTTP{r.status_code}"}
+        except Exception as e: return {"error":str(e)}
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
     try:
-        r = _r.post(url, json=d, headers={"Content-Type":"application/json","User-Agent":"pm-bot"}, timeout=15)
-        return r.json() if r.status_code in [200,201] else {"error":f"HTTP{r.status_code}"}
-    except Exception as e:
-        return {"error":str(e)}
+        r = Request(url, data=json.dumps(data).encode(),
+                   headers={"Content-Type":"application/json","User-Agent":"pm-bot"}, method="POST")
+        with urlopen(r, timeout=15) as resp: return json.loads(resp.read().decode())
+    except HTTPError as e:
+        body = e.read().decode()[:300] if e.fp else ""
+        return {"error":str(e),"body":body}
+    except Exception as e: return {"error":str(e)}
 
+# ═══════════════════════════════════════════════
+# 1. 签名引擎
+# ═══════════════════════════════════════════════
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 
-def eip712(maker, tid, price, size, side, expire, salt):
-    pr = int(price * 1e6)
-    sr = int(size * 1e6)
+def eip712_order(maker, token_id, price, size, side, expire, salt):
+    pr = int(price * 10**6)
+    sr = int(size * 10**6)
     if side == "BUY":
-        ma = pr * sr // 10**6; ta = sr
+        maker_amt = pr * sr // 10**6
+        taker_amt = sr
     else:
-        ma = sr; ta = pr * sr // 10**6
+        maker_amt = sr
+        taker_amt = pr * sr // 10**6
+    
     return {
         "types": {
-            "EIP712Domain": [{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],
-            "Order": [{"name":"salt","type":"uint256"},{"name":"maker","type":"address"},{"name":"signer","type":"address"},{"name":"taker","type":"address"},{"name":"tokenId","type":"uint256"},{"name":"makerAmount","type":"uint256"},{"name":"takerAmount","type":"uint256"},{"name":"expiration","type":"uint256"},{"name":"nonce","type":"uint256"},{"name":"feeRateBps","type":"uint256"},{"name":"side","type":"uint8"},{"name":"signatureType","type":"uint256"}]
+            "EIP712Domain": [
+                {"name":"name","type":"string"},{"name":"version","type":"string"},
+                {"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"},
+            ],
+            "Order": [
+                {"name":"salt","type":"uint256"},{"name":"maker","type":"address"},
+                {"name":"signer","type":"address"},{"name":"taker","type":"address"},
+                {"name":"tokenId","type":"uint256"},{"name":"makerAmount","type":"uint256"},
+                {"name":"takerAmount","type":"uint256"},{"name":"expiration","type":"uint256"},
+                {"name":"nonce","type":"uint256"},{"name":"feeRateBps","type":"uint256"},
+                {"name":"side","type":"uint8"},{"name":"signatureType","type":"uint256"},
+            ],
         },
         "primaryType": "Order",
         "domain": {"name":"Polymarket CLOB","version":"1","chainId":CHAIN,"verifyingContract":CLOB_CONTRACT},
-        "message": {"salt":salt,"maker":maker,"signer":maker,"taker":"0x0000000000000000000000000000000000000000","tokenId":int(tid),"makerAmount":ma,"takerAmount":ta,"expiration":expire,"nonce":0,"feeRateBps":0,"side":0 if side=="BUY" else 1,"signatureType":0}
+        "message": {
+            "salt":salt,"maker":maker,"signer":maker,
+            "taker":"0x0000000000000000000000000000000000000000",
+            "tokenId":int(token_id),
+            "makerAmount":maker_amt,"takerAmount":taker_amt,
+            "expiration":expire,"nonce":0,"feeRateBps":0,
+            "side":0 if side=="BUY" else 1,"signatureType":0,
+        },
     }
 
-def sign_order(pk, maker, tid, side, price, size):
+def sign_and_place(pk, maker, token_id, side, price, size):
     expire = int(time.time()) + 120
     salt = int(time.time() * 1000000) % (2**32)
-    msg = eip712(maker, tid, price, size, side, expire, salt)
+    od = eip712_order(maker, token_id, price, size, side, expire, salt)
+    
     acct = Account.from_key(pk)
-    try:
-        signed = acct.sign_typed_data(msg)
-        sig = "0x" + signed.signature.hex()
-    except:
-        enc = encode_typed_data(msg)
-        signed = Account.sign_message(enc, acct.key)
-        sig = "0x" + signed.signature.hex()
-    return _post(f"{CLOB}/order", {
-        "order": {"salt":str(msg["message"]["salt"]),"maker":maker,"signer":maker,"taker":"0x0000000000000000000000000000000000000000","tokenId":str(int(tid)),"makerAmount":str(msg["message"]["makerAmount"]),"takerAmount":str(msg["message"]["takerAmount"]),"expiration":str(expire),"nonce":"0","feeRateBps":"0","side":str(msg["message"]["side"]),"signatureType":0,"signature":sig},
-        "owner": maker
-    })
+    enc = encode_typed_data(od)
+    signed = Account.sign_message(enc, acct.key)
+    sig = "0x" + signed.signature.hex()
+    
+    payload = {
+        "order": {
+            "salt": od["message"]["salt"], "maker": maker, "signer": maker,
+            "taker": "0x0000000000000000000000000000000000000000",
+            "tokenId": str(od["message"]["tokenId"]),
+            "makerAmount": str(od["message"]["makerAmount"]),
+            "takerAmount": str(od["message"]["takerAmount"]),
+            "expiration": str(expire), "nonce": "0", "feeRateBps": "0",
+            "side": str(od["message"]["side"]), "signatureType": 0,
+            "signature": sig,
+        },
+        "owner": maker,
+    }
+    
+    return _post(f"{CLOB}/order", payload)
 
-price_history = {}
+# ═══════════════════════════════════════════════
+# 2. 市场扫描
+# ═══════════════════════════════════════════════
 
-def scan():
-    data = _get(f"{GAMMA}/markets?limit=500&closed=false&tag=5-minute")
-    markets = data if isinstance(data, list) else data.get("data", data) if isinstance(data, dict) else []
-    if not isinstance(markets, list): markets = []
-    res = {}
+def scan_markets():
+    data = _get(f"{GAMMA}/markets?limit=500&closed=false")
+    markets = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(markets, list):
+        return []
+    
+    signals = []
     for m in markets:
         try:
-            slug = m.get("slug","").lower()
-            if slug not in TARGET_SLUGS: continue
-            name = TARGET_SLUGS[slug]
-            cid = m.get("conditionId","")
-            tids_raw = m.get("clobTokenIds","[]")
-            tids = json.loads(tids_raw) if isinstance(tids_raw,str) else (tids_raw or [])
-            if len(tids) < 2 or not cid: continue
+            t = m.get("clobTokenIds", "[]")
+            tids = json.loads(t) if isinstance(t, str) else (t or [])
+            if len(tids) < 2: continue
+            
             yb = _get(f"{CLOB}/book?token_id={tids[0]}")
             nb = _get(f"{CLOB}/book?token_id={tids[1]}")
             if not yb or not nb: continue
-            ya = yb.get("asks",[]); ybids = yb.get("bids",[])
-            na = nb.get("asks",[]); nbids = nb.get("bids",[])
+            
+            ya = yb.get("asks", [])
+            na = nb.get("asks", [])
+            ybids = yb.get("bids", [])
+            nbids = nb.get("bids", [])
             if not ya or not na: continue
-            yes_a = float(ya[0]["price"]); yes_b = float(ybids[0]["price"]) if ybids else yes_a * 0.98
-            no_a = float(na[0]["price"]); no_b = float(nbids[0]["price"]) if nbids else no_a * 0.98
-            yes_m = (yes_b + yes_a) / 2; no_m = (no_b + no_a) / 2
-            prev = price_history.get(slug, {})
-            yt = "up" if prev.get("yes",0) < yes_m else ("down" if prev.get("yes",0) > yes_m else "flat")
-            nt = "up" if prev.get("no",0) < no_m else ("down" if prev.get("no",0) > no_m else "flat")
-            price_history[slug] = {"yes": yes_m, "no": no_m}
-            cheap = "YES" if yes_m <= no_m else "NO"
-            cheap_p = min(yes_m, no_m)
-            diff = abs(no_m - yes_m)
-            ts = None; tst = 0
-            if yt == "up": ts="YES"; tst=yes_m - prev.get("yes",yes_m)
-            if nt == "up": ts="NO"; tst=no_m - prev.get("no",no_m)
-            res[slug] = {"name":name,"condition_id":cid,"token_yes":tids[0],"token_no":tids[1], "yes_mid":round(yes_m,4),"no_mid":round(no_m,4),"yes_trend":yt,"no_trend":nt, "cheap_side":cheap,"cheap_price":round(cheap_p,4),"price_diff":round(diff,4), "trend_side":ts,"trend_strength":round(tst,4) if ts else 0,"is_extreme":cheap_p<0.15}
+            
+            buy_y = float(ya[0]["price"])
+            buy_n = float(na[0]["price"])
+            total = buy_y + buy_n
+            arb = 1.0 - total
+            
+            sell_y = float(ybids[0]["price"]) if ybids else buy_y * 1.01
+            sell_n = float(nbids[0]["price"]) if nbids else buy_n * 1.01
+            
+            signals.append({
+                "question": m.get("question", "?")[:50],
+                "condition_id": m.get("conditionId", "") or m.get("conditionID", ""),
+                "token_yes": tids[0], "token_no": tids[1],
+                "buy_yes": buy_y, "buy_no": buy_n,
+                "sell_yes": sell_y, "sell_no": sell_n,
+                "total_cost": total, "arb": arb,
+                "exit_value": sell_y + sell_n,
+                "volume": float(m.get("volume", 0) or 0),
+                "liquidity": float(m.get("liquidity", 0) or 0),
+            })
         except:
             continue
-    return res
+    
+    signals.sort(key=lambda s: s["arb"], reverse=True)
+    return signals
 
-app = Flask(__name__)
-bot_pk = os.environ.get("POLY_PRIVATE_KEY","")
-bot_maker = ""
-bot_pnl=0.0; bot_trades=0; bot_wins=0; bot_losses=0; bot_cycle=0
-bot_positions=[]; bot_history=[]; last_scan=""; last_trade=""; last_scan_data={}
-if bot_pk: bot_maker = Account.from_key(bot_pk).address
+# ═══════════════════════════════════════════════
+# 3. 仓位管理
+# ═══════════════════════════════════════════════
 
-def trade_loop():
-    global bot_pnl,bot_trades,bot_wins,bot_losses,bot_cycle,bot_positions,bot_history,last_scan,last_trade,last_scan_data
-    while True:
+class Manager:
+    def __init__(self):
+        self.file = "pm_state.json"
+        self.positions = []
+        self.history = []
+        self.stats = {"cycles":0, "trades":0, "wins":0, "losses":0, "pnl":0.0}
+        self.load()
+    
+    def load(self):
         try:
-            bot_cycle += 1
-            now = datetime.now()
-            minute = now.minute % 5
-            sec = now.second
-            log.info(f"\n{'='*55}")
-            log.info(f"v4 第{bot_cycle}轮 {now.strftime('%H:%M:%S')} {minute}m{sec}s 开仓{len(bot_positions)}笔 PnL:${bot_pnl:.2f}")
+            with open(self.file) as f:
+                d = json.load(f)
+                self.positions = [p for p in d.get("positions",[]) if p.get("status")=="OPEN"]
+                self.history = d.get("history",[])
+                self.stats = d.get("stats",self.stats)
+        except: pass
+    
+    def save(self):
+        with open(self.file,"w") as f:
+            json.dump({
+                "positions":self.positions,
+                "history":self.history[-500:],
+                "stats":self.stats,
+                "updated":time.time(),
+            }, f, indent=2)
+    
+    def open(self, pos):
+        pos["status"] = "OPEN"
+        pos["open_time"] = time.time()
+        self.positions.append(pos)
+        self.save()
+    
+    def close(self, cid, pnl):
+        for p in self.positions[:]:
+            if p["condition_id"] == cid:
+                p["status"] = "CLOSED"
+                p["pnl"] = round(pnl, 4)
+                p["close_time"] = time.time()
+                p["hold_m"] = round((p["close_time"]-p["open_time"])/60, 1)
+                self.history.append(p)
+                self.positions.remove(p)
+                self.stats["trades"] += 1
+                self.stats["pnl"] += pnl
+                if pnl >= 0: self.stats["wins"] += 1
+                else: self.stats["losses"] += 1
+                self.save()
+                return True
+        return False
+    
+    def daily_pnl(self):
+        return sum(h.get("pnl",0) for h in self.history
+                  if h.get("close_time",0) > time.time()-86400)
+    
+    def occupied(self):
+        return sum(p.get("size",0)*2 for p in self.positions)
+    
+    def summary(self):
+        lines = [
+            f"📊 #{self.stats['cycles']} | PnL:${self.stats['pnl']:.2f} "
+            f"今日:${self.daily_pnl():.2f} "
+            f"| {self.stats['wins']}W/{self.stats['losses']}L "
+            f"| 开仓:{len(self.positions)} ${self.occupied():.0f}"
+        ]
+        for p in self.positions:
+            lines.append(f"  {p['question'][:35]} arb={p['arb']:.3f} "
+                        f"hold={(time.time()-p['open_time'])/60:.0f}m")
+        return "\n".join(lines)
 
-            # 平仓
-            for p in bot_positions[:]:
-                hid = (time.time()-p["ot"])/60
-                tid = p["tid"]; bp = p["bp"]; sz = p["sz"]; side = p["side"]
-                book = _get(f"{CLOB}/book?token_id={tid}")
-                if not book: continue
-                bids = book.get("bids",[])
-                cur = float(bids[0]["price"]) if bids else None
-                if not cur: continue
-                pnl = cur - bp; sell=False; sp=1.0; reason=""
-                if cur >= 0.95: sell=True; reason=f"近1.0@{cur:.4f}"
-                elif 1.0<=hid<=3.0 and not p.get("ps",False): sell=True; sp=0.75; p["ps"]=True; reason=f"中段{hid:.1f}m"
-                elif hid>=4.0: sell=True; reason=f"超时{hid:.1f}m"
-                elif pnl>0.02 and hid>=1.5: sell=True; reason=f"盈利${pnl:.4f}"
-                if sell:
-                    ss = sz * sp
-                    if ss < 0.01: continue
-                    r = sign_order(bot_pk,bot_maker,tid,"SELL",cur,ss)
-                    n = (cur-bp)*ss - 0.001*ss
-                    bot_pnl += n; bot_trades += 1
-                    if n>=0: bot_wins+=1
-                    else: bot_losses+=1
-                    bot_history.append({"t":time.time(),"name":p["name"],"side":side,"buy":bp,"sell":cur,"sz":ss,"pnl":round(n,4),"reason":reason})
-                    rem = sz - ss
-                    if rem<0.01: bot_positions.remove(p); log.info(f"✅ 平 {p['name']} {side} PnL:${n:+.4f}")
-                    else: p["sz"]=rem; log.info(f"⏳ {p['name']} 剩{rem:.2f}等结算")
+# ═══════════════════════════════════════════════
+# 4. 主循环
+# ═══════════════════════════════════════════════
 
-            # 扫描
-            markets = scan()
-            last_scan_data = markets
+class Bot:
+    def __init__(self, pk):
+        self.pk = pk
+        self.maker = Account.from_key(pk).address
+        self.mgr = Manager()
+        log.info(f"钱包: {self.maker[:10]}...{self.maker[-6:]}")
+        log.info(f"参数: ${BET}/边 ${MAX_OCCUPIED}上限 日亏${LOSS_LIMIT}停止")
+    
+    def run(self):
+        log.info(f"\n{'='*50}")
+        log.info("🚀 启动")
+        log.info(f"{'='*50}\n")
+        try:
+            while True:
+                self._cycle()
+                wait = CYCLE_S - (time.time() % CYCLE_S)
+                log.info(f"⏳ {wait:.0f}s后下一轮")
+                time.sleep(wait)
+        except KeyboardInterrupt:
+            log.info("🛑 手动停止")
+    
+    def _cycle(self):
+        self.mgr.stats["cycles"] += 1
+        log.info(f"\n{'─'*40}")
+        log.info(f"🔁 第{self.mgr.stats['cycles']}轮 {datetime.now().strftime('%H:%M')}")
+        
+        if self.mgr.daily_pnl() <= -LOSS_LIMIT:
+            log.error(f"🛑 日亏${self.mgr.daily_pnl():.2f} 已达上限")
+            exit(0)
+        
+        self._check_open()
+        
+        signals = scan_markets()
+        arb = [s for s in signals if s["arb"] >= 0.005]
+        log.info(f"扫描: {len(signals)}总 {len(arb)}可套利")
+        
+        if arb:
+            taken = 0
+            for s in arb:
+                cost = BET * 2
+                if self.mgr.occupied() + cost > MAX_OCCUPIED:
+                    break
+                if any(p["condition_id"]==s["condition_id"] for p in self.mgr.positions):
+                    continue
+                
+                log.info(f"📈 {s['question'][:35]}")
+                log.info(f"   买Yes@{s['buy_yes']:.4f}+No@{s['buy_no']:.4f} "
+                        f"={s['total_cost']:.4f} arb={s['arb']:.3f}")
+                
+                yr = sign_and_place(self.pk, self.maker, s["token_yes"], "BUY",
+                                   s["buy_yes"], BET)
+                nr = sign_and_place(self.pk, self.maker, s["token_no"], "BUY",
+                                   s["buy_no"], BET)
+                
+                self.mgr.open({
+                    "condition_id": s["condition_id"],
+                    "question": s["question"][:40],
+                    "token_yes": s["token_yes"], "token_no": s["token_no"],
+                    "buy_yes": s["buy_yes"], "buy_no": s["buy_no"],
+                    "sell_yes": s["sell_yes"], "sell_no": s["sell_no"],
+                    "arb": s["arb"], "size": BET,
+                })
+                taken += 1
+                log.info(f"   ✅ Yes:{yr.get('status','?')} No:{nr.get('status','?')}")
+            
+            if taken:
+                log.info(f"新开{taken}笔")
+        
+        log.info(self.mgr.summary())
+    
+    def _check_open(self):
+        for p in self.mgr.positions[:]:
+            m = _get(f"{GAMMA}/markets/{p['condition_id']}")
+            if not m: continue
+            try:
+                pr = m.get("outcomePrices","[]")
+                prices = json.loads(pr) if isinstance(pr,str) else (pr or [])
+                if len(prices) < 2: continue
+                cur_sum = float(prices[0]) + float(prices[1])
+            except: continue
+            
+            hold = (time.time() - p["open_time"]) / 60
+            should = False; reason = ""
+            if cur_sum >= 0.995:
+                should = True; reason = f"收敛{cur_sum:.4f}"
+            elif hold >= 60:
+                should = True; reason = f"超时{hold:.0f}m"
+            
+            if should:
+                ys = sign_and_place(self.pk, self.maker, p["token_yes"], "SELL",
+                                   p["sell_yes"], BET)
+                ns = sign_and_place(self.pk, self.maker, p["token_no"], "SELL",
+                                   p["sell_no"], BET)
+                
+                gross = (1.0 - p["buy_yes"] - p["buy_no"]) * BET * 2
+                fees = 0.001 * BET * 2
+                pnl = gross - fees
+                
+                self.mgr.close(p["condition_id"], pnl)
+                ico = "✅" if pnl >= 0 else "❌"
+                log.info(f"{ico} {p['question'][:30]} ${pnl:+.2f} {reason}")
 
-            # 开仓决策
-            opps = []
-            for slug,m in markets.items():
-                name = m["name"]
-                if minute>=4 and sec>30: continue
-                cheap = m["cheap_side"]; cheap_p = m["cheap_price"]; diff = m["price_diff"]
-                if diff>=0.02 or m["is_extreme"]:
-                    sz = BET
-                    if m["is_extreme"]: sz = BET*0.5
-                    opps.append((slug,name,m["condition_id"],m["token_yes"] if cheap=="YES" else m["token_no"],cheap,cheap_p,sz))
-                    log.info(f"  {name}: 买{cheap}@{cheap_p:.4f} diff={diff:.4f}")
-                ts = m["trend_side"]; tst = m["trend_strength"]
-                if ts and diff<0.10 and tst>0.01:
-                    tp = m["yes_mid"] if ts=="YES" else m["no_mid"]
-                    opps.append((slug,name,m["condition_id"],m["token_yes"] if ts=="YES" else m["token_no"],ts,tp,BET*0.3))
-                    log.info(f"  {name}: 追{ts}@{tp:.4f}")
-
-            for slug,name,cid,tid,side,price,sz in opps:
-                occ = sum(p.get("sz",0)*2 for p in bot_positions)
-                if occ+BET*2 > MAX_OCCUPIED: break
-                if any(p["cid"]==cid for p in bot_positions): continue
-                r = sign_order(bot_pk,bot_maker,tid,"BUY",price,sz)
-                log.info(f"📈 开{name} 买{side}@{price:.4f}x{sz:.1f} -> {r.get('status','?') if isinstance(r,dict) else '?'}")
-                bot_positions.append({"cid":cid,"name":name,"side":side,"tid":tid,"bp":price,"sz":sz,"ot":time.time()})
-                last_trade = f"{now.strftime('%H:%M')} {name} {side}@{price:.4f}"
-
-            occ = sum(p.get("sz",0)*2 for p in bot_positions)
-            log.info(f"📊 PnL:${bot_pnl:.2f} 开仓{len(bot_positions)}笔 ${occ:.1f} 历史{bot_trades}笔 {bot_wins}W/{bot_losses}L")
-            last_scan = f"{now.strftime('%H:%M')} {len(markets)}个市场"
-
-        except Exception as e:
-            log.error(f"异常:{e}")
-            import traceback; log.error(traceback.format_exc())
-        time.sleep(CYCLE_S - (time.time() % CYCLE_S))
-
-@app.route("/")
-def home():
-    mr = ""
-    for s in ["btc-5m","eth-5m","sol-5m","xrp-5m","doge-5m","hype-5m","bnb-5m"]:
-        m = last_scan_data.get(s,{})
-        if m:
-            mr += f"<tr><td>{m['name']}</td><td>{m['yes_mid']:.4f}</td><td>{m['no_mid']:.4f}</td><td>{m['cheap_side']}@{m['cheap_price']:.4f}</td><td>{m['price_diff']:.4f}</td></tr>"
-        else:
-            mr += f"<tr><td>{s[:3].upper()}</td><td colspan=4 style='color:#666'>无数据</td></tr>"
-    ph = ""
-    for p in bot_positions:
-        h = (time.time()-p["ot"])/60
-        ph += f"<div>{p['name']} {p['side']} @${p['bp']:.4f}x{p['sz']:.1f} hold{h:.0f}m</div>"
-    rh = bot_history[-8:] if bot_history else []
-    hh = "<br>".join(f"{'🟢' if h['pnl']>=0 else '🔴'}{h['name']} ${h['pnl']:+.2f}({h['reason']})" for h in reversed(rh)) if rh else "<div>暂无</div>"
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="15"><style>
-body{{font:14px monospace;background:#0a0a1a;color:#eee;padding:20px;max-width:750px;margin:auto}}
-h1{{color:#00d2ff}} .card{{background:#1a1a2e;border-radius:8px;padding:15px;margin:8px 0}}
-.pnl{{font-size:28px;font-weight:bold;color:{'#0f8' if bot_pnl>=0 else '#f44'}}}
-.gray{{color:#888}} table{{width:100%}} th{{color:#888;text-align:left}} td{{padding:3px;border-bottom:1px solid #222}}
-</style></head><body>
-<h1>PM Bot v4</h1>
-<div class=card><div class=pnl>${bot_pnl:.2f}</div><div>{bot_trades}笔 {bot_wins}W/{bot_losses}L {round(bot_wins/bot_trades*100,1) if bot_trades else 0}% | {bot_cycle}轮 | 开仓{len(bot_positions)}</div></div>
-<div class=card><h2>7币种</h2><table><tr><th>币</th><th>Yes</th><th>No</th><th>便宜边</th><th>价差</th></tr>{mr}</table></div>
-<div class=card><h2>开仓</h2>{ph if ph else '<div class=gray>无</div>'}</div>
-<div class=card><h2>最近交易</h2>{hh}</div>
-</body></html>"""
-
-@app.route("/api/status")
-def st():
-    return jsonify({"pnl":round(bot_pnl,2),"trades":bot_trades,"wins":bot_wins,"losses":bot_losses,"cycle":bot_cycle,"positions":len(bot_positions)})
-
-@app.route("/api/history")
-def h():
-    return jsonify(bot_history[-50:])
+def main():
+    print("="*55)
+    print("  Polymarket 交易机器人")
+    print("  策略: Price-Sum套利 | 可热插拔")
+    print("="*55)
+    print()
+    
+    pk = os.environ.get("POLY_PRIVATE_KEY", "")
+    if not pk:
+        try:
+            import getpass
+            pk = getpass.getpass("私钥 (0x...): ").strip()
+        except:
+            pk = input("私钥 (0x...): ").strip()
+    
+    if not pk or len(pk) < 64:
+        log.error("私钥无效")
+        return
+    
+    Bot(pk).run()
 
 if __name__ == "__main__":
-    if not bot_pk:
-        log.error("请设置 POLY_PRIVATE_KEY")
-        exit(1)
-    log.info(f"钱包:{bot_maker[:10]}.. | $4/边 | 上限$20 | 监控{len(TARGET_SLUGS)}币种")
-    threading.Thread(target=trade_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    main()
