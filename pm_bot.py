@@ -439,11 +439,11 @@ def recent_log():
 # ═══════════════════════════════════════════════
 
 def main():
-    pk = os.environ.get("POLY_PRIVATE_KEY", "")
+    pk = os.environ.get("PRIVATE_KEY") or os.environ.get("POLY_PRIVATE_KEY", "")
     if not pk and len(sys.argv) > 1:
         pk = sys.argv[1]
     if not pk:
-        print("❌ 需要设置 POLY_PRIVATE_KEY 环境变量")
+        print("❌ 需要设置 PRIVATE_KEY 环境变量")
         sys.exit(1)
     if not pk.startswith("0x"):
         pk = "0x" + pk
