@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Polymarket 交易机器人 — 学习版
+Polymarket 交易机器人 — 学习版 (Railway 部署)
 可插拔策略架构 + 真实CLOB签名下单
-先跑扫描 + 套利，策略随时换
+含 Web Health Check 供 Railway 使用
 """
 import json, time, logging, sys, os
 from datetime import datetime
+from flask import Flask, jsonify
+import threading
 
 # ─── 日志 ───
 logging.basicConfig(
@@ -34,7 +36,7 @@ try:
 except ImportError:
     _HAS_REQUESTS = False
 
-def _proxy(): return None  # Railway/直连模式
+def _proxy():
     p = {}
     for k in ['https_proxy','HTTPS_PROXY','http_proxy','HTTP_PROXY','all_proxy','ALL_PROXY']:
         v = os.environ.get(k, "").strip()
@@ -269,26 +271,35 @@ class Manager:
 # 4. 主循环
 # ═══════════════════════════════════════════════
 
+bot_instance = None
+
 class Bot:
     def __init__(self, pk):
         self.pk = pk
         self.maker = Account.from_key(pk).address
         self.mgr = Manager()
+        self._running = False
+        global bot_instance
+        bot_instance = self
         log.info(f"钱包: {self.maker[:10]}...{self.maker[-6:]}")
         log.info(f"参数: ${BET}/边 ${MAX_OCCUPIED}上限 日亏${LOSS_LIMIT}停止")
     
     def run(self):
+        self._running = True
         log.info(f"\n{'='*50}")
         log.info("🚀 启动")
         log.info(f"{'='*50}\n")
         try:
-            while True:
+            while self._running:
                 self._cycle()
                 wait = CYCLE_S - (time.time() % CYCLE_S)
                 log.info(f"⏳ {wait:.0f}s后下一轮")
                 time.sleep(wait)
         except KeyboardInterrupt:
             log.info("🛑 手动停止")
+    
+    def stop(self):
+        self._running = False
     
     def _cycle(self):
         self.mgr.stats["cycles"] += 1
@@ -297,7 +308,7 @@ class Bot:
         
         if self.mgr.daily_pnl() <= -LOSS_LIMIT:
             log.error(f"🛑 日亏${self.mgr.daily_pnl():.2f} 已达上限")
-            exit(0)
+            os._exit(0)
         
         self._check_open()
         
@@ -371,26 +382,59 @@ class Bot:
                 ico = "✅" if pnl >= 0 else "❌"
                 log.info(f"{ico} {p['question'][:30]} ${pnl:+.2f} {reason}")
 
+# ═══════════════════════════════════════════════
+# 5. Flask Web服务 (用于Railway Health Check)
+# ═══════════════════════════════════════════════
+
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    info = {"status": "running", "uptime": 0}
+    if bot_instance:
+        info.update({
+            "cycles": bot_instance.mgr.stats["cycles"],
+            "trades": bot_instance.mgr.stats["trades"],
+            "pnl": bot_instance.mgr.stats["pnl"],
+            "wins": bot_instance.mgr.stats["wins"],
+            "losses": bot_instance.mgr.stats["losses"],
+            "open_positions": len(bot_instance.mgr.positions),
+            "daily_pnl": bot_instance.mgr.daily_pnl(),
+            "wallet": bot_instance.maker[:10] + "...",
+        })
+    return jsonify(info)
+
+@app.route("/log")
+def recent_log():
+    try:
+        with open("pm_bot.log") as f:
+            lines = f.readlines()[-50:]
+        return jsonify({"lines": lines})
+    except:
+        return jsonify({"lines": []})
+
+# ═══════════════════════════════════════════════
+# 入口
+# ═══════════════════════════════════════════════
+
 def main():
-    print("="*55)
-    print("  Polymarket 交易机器人")
-    print("  策略: Price-Sum套利 | 可热插拔")
-    print("="*55)
-    print()
-    
     pk = os.environ.get("POLY_PRIVATE_KEY", "")
+    if not pk and len(sys.argv) > 1:
+        pk = sys.argv[1]
     if not pk:
-        try:
-            import getpass
-            pk = getpass.getpass("私钥 (0x...): ").strip()
-        except:
-            pk = input("私钥 (0x...): ").strip()
+        print("❌ 需要设置 POLY_PRIVATE_KEY 环境变量")
+        sys.exit(1)
+    if not pk.startswith("0x"):
+        pk = "0x" + pk
     
-    if not pk or len(pk) < 64:
-        log.error("私钥无效")
-        return
+    # 在后台线程中运行bot
+    bot = Bot(pk)
+    t = threading.Thread(target=bot.run, daemon=True)
+    t.start()
     
-    Bot(pk).run()
+    # Flask web服务 (Railway需要)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
