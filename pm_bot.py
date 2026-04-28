@@ -25,7 +25,7 @@ CYCLE_S = 300
 
 # ─── Telegram 通知 ───
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8493341941:AAEshKfSO9jO3wX69EoCJdvIzjlziLinVlk")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "5739995837")
 
 def tg_send(msg):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
