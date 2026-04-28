@@ -23,6 +23,23 @@ MAX_OCCUPIED = 8.0
 LOSS_LIMIT = 3.0
 CYCLE_S = 300
 
+# ─── Telegram 通知 ───
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8493341941:AAEshKfSO9jO3wX69EoCJdvIzjlziLinVlk")
+TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
+def tg_send(msg):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        _r.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        log.warning(f"TG通知失败: {e}")
+
+def tg_notify(msg, level="info"):
+    log.info(f"[TG] {msg}")
+    tg_send(msg)
+
 # ─── API ───
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
@@ -283,6 +300,7 @@ class Bot:
         bot_instance = self
         log.info(f"钱包: {self.maker[:10]}...{self.maker[-6:]}")
         log.info(f"参数: ${BET}/边 ${MAX_OCCUPIED}上限 日亏${LOSS_LIMIT}停止")
+        tg_notify(f"🤖 Polymarket Bot 启动\n💰 钱包: {self.maker[:8]}...\n📐 ${BET}/边 | 上限${MAX_OCCUPIED} | 日亏${LOSS_LIMIT}停止")
     
     def run(self):
         self._running = True
@@ -308,6 +326,7 @@ class Bot:
         
         if self.mgr.daily_pnl() <= -LOSS_LIMIT:
             log.error(f"🛑 日亏${self.mgr.daily_pnl():.2f} 已达上限")
+            tg_notify(f"🛑 <b>风控触发！</b> 日亏${self.mgr.daily_pnl():.2f} 已达${LOSS_LIMIT}上限，停止交易")
             os._exit(0)
         
         self._check_open()
@@ -344,6 +363,7 @@ class Bot:
                 })
                 taken += 1
                 log.info(f"   ✅ Yes:{yr.get('status','?')} No:{nr.get('status','?')}")
+                tg_notify(f"📈 开仓: {s['question'][:25]} arb={s['arb']:.3f} ${BET}/边")
             
             if taken:
                 log.info(f"新开{taken}笔")
@@ -381,6 +401,7 @@ class Bot:
                 self.mgr.close(p["condition_id"], pnl)
                 ico = "✅" if pnl >= 0 else "❌"
                 log.info(f"{ico} {p['question'][:30]} ${pnl:+.2f} {reason}")
+                tg_notify(f"{ico} 平仓: {p['question'][:25]} ${pnl:+.2f} ({reason})")
 
 # ═══════════════════════════════════════════════
 # 5. Flask Web服务 (用于Railway Health Check)
