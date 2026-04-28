@@ -1,0 +1,29 @@
+name: Run Polymarket Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install
+        run: |
+          pip install eth-account web3 requests flask
+      
+      - name: Run Bot
+        env:
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          python pm_bot.py
